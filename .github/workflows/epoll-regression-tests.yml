@@ -4,10 +4,47 @@ on:
   schedule:
     - cron: "0 0/3 * * *"
   workflow_dispatch:
+    inputs:
+      test-suites:
+        description: "Optional pytest filenames; keep empty for all suites. Example: connection_test,eval_test"
+        required: false
+        default: ""
+        type: string
+      test-cases:
+        description: "Optional regex for pytest node IDs; keep empty for all cases. Example: test_golang_asynq_script|test_shared_read_buffer_overflow_copy_metric"
+        required: false
+        default: ""
+        type: string
+      iterations:
+        description: "Optional pytest run count; default is 1. Example: 12"
+        required: false
+        default: "1"
+        type: string
+      gtest-suites:
+        description: "Optional GoogleTest target names; keep empty for all suites in src/core, src/facade, and src/server. Example: dfly_core_test,redis_parser_test"
+        required: false
+        default: ""
+        type: string
+      gtest-cases:
+        description: "Optional GoogleTest --gtest_filter value; keep empty for all cases. Example: StringMapTest.*:DashTest.*"
+        required: false
+        default: ""
+        type: string
+      gtest-iterations:
+        description: "Optional GoogleTest run count; default is 1. Example: 12"
+        required: false
+        default: "1"
+        type: string
+      continue-on-test-failure:
+        description: "Optional: set true to finish all selected iterations after test failures; default false aborts on the first test failure"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
     if: github.repository == 'dragonflydb/dragonfly'
+    timeout-minutes: 360
     strategy:
       matrix:
         # Test of these containers
@@ -67,6 +104,14 @@ jobs:
           gspace-secret: ${{ secrets.GSPACES_BOT_DF_BUILD }}
           build-folder-name: build
           filter: ${{ matrix.build-type == 'Release' && 'not empty' || 'not opt_only' }}
+          test-suites: ${{ inputs.test-suites || '' }}
+          test-cases: ${{ inputs.test-cases || '' }}
+          iterations: ${{ inputs.iterations || '1' }}
+          gtest-suites: ${{ inputs.gtest-suites || '' }}
+          gtest-cases: ${{ inputs.gtest-cases || '' }}
+          gtest-iterations: ${{ inputs.gtest-iterations || '1' }}
+          continue-on-test-failure: ${{ inputs.continue-on-test-failure || 'false' }}
+          test-timeout-minutes: '357'
           s3-bucket: ${{ secrets.S3_REGTEST_BUCKET }}
           junit-s3-bucket: ${{ secrets.S3_REGTEST_BUCKET }}
           aws-role-to-assume: ${{ secrets.AWS_CI_S3_ROLE_ARN }}

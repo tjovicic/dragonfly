@@ -59,6 +59,46 @@ inputs:
     required: false
     type: string
     description: "Runtime flags to pass to the dragonfly process via --df, e.g. 'enable_resp_io_loop_v2=true'"
+  test-suites:
+    required: false
+    default: ""
+    type: string
+    description: "Optional pytest filenames relative to tests/dragonfly; empty runs all suites"
+  test-cases:
+    required: false
+    default: ""
+    type: string
+    description: "Optional extended regular expression matched against collected pytest node IDs; empty runs all cases"
+  iterations:
+    required: false
+    default: "1"
+    type: string
+    description: "Optional number of times to run selected pytest tests; defaults to 1"
+  gtest-suites:
+    required: false
+    default: ""
+    type: string
+    description: "Optional GoogleTest target names; empty runs all suites under src/core, src/facade, and src/server"
+  gtest-cases:
+    required: false
+    default: ""
+    type: string
+    description: "Optional value forwarded to --gtest_filter; empty runs all GoogleTest cases"
+  gtest-iterations:
+    required: false
+    default: "1"
+    type: string
+    description: "Optional number of times to run selected GoogleTest suites; defaults to 1"
+  continue-on-test-failure:
+    required: false
+    default: "false"
+    type: string
+    description: "When true, continue selected iterations after test failures and fail after all runs complete"
+  test-timeout-minutes:
+    required: false
+    default: "357"
+    type: string
+    description: "Total test-runtime limit in minutes"
 
 runs:
   using: "composite"
@@ -105,15 +145,17 @@ runs:
         SAFE_FILTER=$("${GITHUB_WORKSPACE}/.github/scripts/sanitize-token.sh" "${FILTER}" all)
 
         UNIQUE_SUFFIX="$(date +%s%N)-${RANDOM}"
+        deadline_epoch=$(( $(date +%s) + ${{ inputs.test-timeout-minutes }} * 60 ))
         {
           echo "REGRESSION_JUNIT_DIR=${JUNIT_DIR}"
           echo "REGRESSION_JUNIT_KIND=${KIND}"
+          echo "REGRESSION_TEST_DEADLINE_EPOCH=${deadline_epoch}"
           echo "REGRESSION_JUNIT_S3_SUFFIX=${RUNNER_OS}-${RUNNER_ARCH}-${KIND}-${FILTER}"
           echo "REGRESSION_JUNIT_ARTIFACT=junit-regression-${GITHUB_JOB}-${RUNNER_OS}-${RUNNER_ARCH}-${KIND}-${SAFE_FILTER}-${UNIQUE_SUFFIX}"
         } >> "${GITHUB_ENV}"
 
     - name: Run S3 snapshot tests with MinIO
-      if: inputs.s3-bucket != ''
+      if: inputs.s3-bucket != '' && inputs.test-suites == '' && inputs.test-cases == '' && inputs.iterations == '1'
       shell: bash
       run: |
         echo "=== Running S3 snapshot tests with local MinIO ==="
@@ -137,6 +179,53 @@ runs:
         export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 # to crash on errors
         export FILTER="${{inputs.filter}}"
         JUNIT_DIR="${REGRESSION_JUNIT_DIR}"
+        SUMMARY_FILE="${GITHUB_STEP_SUMMARY:-}"
+        last_summary_seconds=0
+
+        report_progress() {
+          local runner=$1
+          local iteration=$2
+          local total=$3
+          local result=$4
+
+          if [[ -z "${SUMMARY_FILE}" ]] || \
+             (( iteration != total && SECONDS - last_summary_seconds < 300 )); then
+            return
+          fi
+
+          {
+            echo "### Regression Test Progress"
+            echo "- ${runner}: iteration ${iteration}/${total} completed (${result})"
+          } >> "${SUMMARY_FILE}"
+          last_summary_seconds=${SECONDS}
+        }
+
+        if ! [[ "${ITERATIONS_INPUT}" =~ ^[1-9][0-9]*$ ]]; then
+          echo "iterations must be a positive integer, got: ${ITERATIONS_INPUT}"
+          exit 2
+        fi
+        if ! [[ "${TEST_TIMEOUT_MINUTES_INPUT}" =~ ^[1-9][0-9]*$ ]]; then
+          echo "test-timeout-minutes must be a positive integer, got: ${TEST_TIMEOUT_MINUTES_INPUT}"
+          exit 2
+        fi
+
+        TEST_PATHS=()
+        if [[ -n "${TEST_SUITES_INPUT}" ]]; then
+          normalized_suites="${TEST_SUITES_INPUT//,/ }"
+          for suite in ${normalized_suites}; do
+            suite="${suite%.py}.py"
+            if [[ "${suite}" != */* ]]; then
+              suite="dragonfly/${suite}"
+            fi
+            if [[ ! -f "${suite}" ]]; then
+              echo "Test suite not found: ${suite}"
+              exit 2
+            fi
+            TEST_PATHS+=("${suite}")
+          done
+        else
+          TEST_PATHS=(dragonfly)
+        fi
 
         # Runtime flags forwarded to the dragonfly process via --df.
         # Globbing is disabled while splitting so values like vmodule=*=1 are preserved,
@@ -162,18 +251,74 @@ runs:
 
         if [[ "${REGRESSION_JUNIT_KIND}" == 'epoll' ]]; then
           FILTER="$FILTER and not exclude_epoll"
-          # Run only replication tests with epoll
-          timeout 80m pytest -m "$FILTER" --durations=10 --timeout=300 --color=yes \
-            --json-report --json-report-file=report.json \
-            --junitxml="${JUNIT_DIR}/pytest-${REGRESSION_JUNIT_KIND}.xml" \
-            dragonfly --df force_epoll=true "${DF_RUNTIME_ARGS[@]}" --log-cli-level=INFO || code=$?
         else
-          # Run only replication tests with iouring
-          timeout 80m pytest -m "$FILTER" --durations=10 --timeout=300 --color=yes \
-            --json-report --json-report-file=report.json \
-            --junitxml="${JUNIT_DIR}/pytest-${REGRESSION_JUNIT_KIND}.xml" \
-            dragonfly "${DF_RUNTIME_ARGS[@]}" --log-cli-level=INFO || code=$?
+          :
         fi
+
+        SELECTED_TESTS=()
+        if [[ -n "${TEST_CASES_INPUT}" ]]; then
+          mapfile -t SELECTED_TESTS < <(
+            pytest -m "$FILTER" --collect-only -q --color=no "${TEST_PATHS[@]}" 2>/dev/null |
+              grep -E -- "${TEST_CASES_INPUT}" || true
+          )
+          if [[ "${#SELECTED_TESTS[@]}" -eq 0 ]]; then
+            echo "No tests matched test-cases regex: ${TEST_CASES_INPUT}"
+            exit 2
+          fi
+        else
+          SELECTED_TESTS=("${TEST_PATHS[@]}")
+        fi
+
+        deadline_seconds=$((SECONDS + TEST_TIMEOUT_MINUTES_INPUT * 60))
+        case "${CONTINUE_ON_TEST_FAILURE_INPUT}" in
+          true|false) ;;
+          *)
+            echo "continue-on-test-failure must be true or false, got: ${CONTINUE_ON_TEST_FAILURE_INPUT}"
+            exit 2
+            ;;
+        esac
+
+        code=0
+        pytest_failed=false
+        for iteration in $(seq 1 "${ITERATIONS_INPUT}"); do
+          remaining_seconds=$((REGRESSION_TEST_DEADLINE_EPOCH - $(date +%s)))
+          if [[ "${remaining_seconds}" -le 0 ]]; then
+            code=124
+            break
+          fi
+
+          echo "=== Regression test iteration ${iteration}/${ITERATIONS_INPUT} ==="
+          junit_file="${JUNIT_DIR}/pytest-${REGRESSION_JUNIT_KIND}-${iteration}.xml"
+          if [[ "${REGRESSION_JUNIT_KIND}" == 'epoll' ]]; then
+            timeout --foreground "${remaining_seconds}s" pytest -m "$FILTER" --durations=10 \
+              --timeout=300 --color=yes --json-report --json-report-file=report.json \
+              --junitxml="${junit_file}" "${SELECTED_TESTS[@]}" --df force_epoll=true \
+              "${DF_RUNTIME_ARGS[@]}" --log-cli-level=INFO || code=$?
+          else
+            timeout --foreground "${remaining_seconds}s" pytest -m "$FILTER" --durations=10 \
+              --timeout=300 --color=yes --json-report --json-report-file=report.json \
+              --junitxml="${junit_file}" "${SELECTED_TESTS[@]}" "${DF_RUNTIME_ARGS[@]}" \
+              --log-cli-level=INFO || code=$?
+          fi
+
+          if [[ "${code}" -eq 0 ]]; then
+            report_progress "Pytest" "${iteration}" "${ITERATIONS_INPUT}" "passed"
+            continue
+          fi
+
+          if [[ "${code}" -eq 1 ]]; then
+            pytest_failed=true
+            report_progress "Pytest" "${iteration}" "${ITERATIONS_INPUT}" "failed"
+            if [[ "${CONTINUE_ON_TEST_FAILURE_INPUT}" == true ]]; then
+              code=0
+              continue
+            fi
+          fi
+
+          if [[ "${code}" -ne 0 ]]; then
+            break
+          fi
+        done
 
         # timeout returns 124 if we exceeded the timeout duration
         if [[ $code -eq 124 ]]; then
@@ -192,10 +337,17 @@ runs:
         if [[ $code -ne 0 ]]; then
           exit 1
         fi
+
+        echo "PYTEST_TEST_FAILURE=${pytest_failed}" >> "${GITHUB_ENV}"
       env:
         # Pass the raw runtime-flags input through the environment so the value is never
         # embedded directly in the shell script (avoids shell injection).
         DF_RUNTIME_FLAGS_INPUT: ${{ inputs.df-runtime-flags }}
+        TEST_SUITES_INPUT: ${{ inputs.test-suites }}
+        TEST_CASES_INPUT: ${{ inputs.test-cases }}
+        ITERATIONS_INPUT: ${{ inputs.iterations }}
+        CONTINUE_ON_TEST_FAILURE_INPUT: ${{ inputs.continue-on-test-failure }}
+        TEST_TIMEOUT_MINUTES_INPUT: ${{ inputs.test-timeout-minutes }}
         # Add environment variables to enable the S3 snapshot test.
         # AWS credentials: if inputs provided, use them; otherwise rely on workflow OIDC auth
         DRAGONFLY_S3_BUCKET: ${{ inputs.s3-bucket }}
@@ -206,6 +358,115 @@ runs:
         # Azure credentials for snapshot tests (optional)
         DRAGONFLY_AZURE_CONTAINER: ${{ inputs.azure-container }}
         AZURE_STORAGE_CONNECTION_STRING: ${{ inputs.azure-storage-connection-string }}
+
+    - name: Build and run GoogleTests
+      shell: bash
+      run: |
+        cd "${GITHUB_WORKSPACE}"
+        SUMMARY_FILE="${GITHUB_STEP_SUMMARY:-}"
+        last_summary_seconds=0
+
+        report_progress() {
+          local iteration=$1 total=$2 result=$3
+          if [[ -z "${SUMMARY_FILE}" ]] || \
+             (( iteration != total && SECONDS - last_summary_seconds < 300 )); then
+            return
+          fi
+          {
+            echo "### Regression Test Progress"
+            echo "- GoogleTest: iteration ${iteration}/${total} completed (${result})"
+          } >> "${SUMMARY_FILE}"
+          last_summary_seconds=${SECONDS}
+        }
+
+        if ! [[ "${GTEST_ITERATIONS_INPUT}" =~ ^[1-9][0-9]*$ ]]; then
+          echo "gtest-iterations must be a positive integer, got: ${GTEST_ITERATIONS_INPUT}"
+          exit 2
+        fi
+
+        mapfile -t AVAILABLE_GTEST_SUITES < <(
+          find src/core src/facade src/server -name CMakeLists.txt -print0 |
+            xargs -0 grep -hE '^[[:space:]]*helio_cxx_test\(' |
+            sed -E 's/^[[:space:]]*helio_cxx_test\(([[:alnum:]_/-]+).*/\1/' |
+            awk -F/ '{print $NF}' | sort -u
+        )
+        if [[ "${#AVAILABLE_GTEST_SUITES[@]}" -eq 0 ]]; then
+          echo "No GoogleTest suites were discovered under src/core, src/facade, or src/server"
+          exit 2
+        fi
+
+        SELECTED_GTEST_SUITES=()
+        if [[ -n "${GTEST_SUITES_INPUT}" ]]; then
+          normalized_suites="${GTEST_SUITES_INPUT//,/ }"
+          for suite in ${normalized_suites}; do
+            suite="${suite##*/}"
+            suite="${suite%.cc}"
+            if ! printf '%s\n' "${AVAILABLE_GTEST_SUITES[@]}" | grep -Fxq -- "${suite}"; then
+              echo "GoogleTest suite not found: ${suite}"
+              exit 2
+            fi
+            SELECTED_GTEST_SUITES+=("${suite}")
+          done
+        else
+          SELECTED_GTEST_SUITES=("${AVAILABLE_GTEST_SUITES[@]}")
+        fi
+
+        echo "Building GoogleTest suites: ${SELECTED_GTEST_SUITES[*]}"
+        cd "${GITHUB_WORKSPACE}/${{ inputs.build-folder-name }}"
+        ninja "${SELECTED_GTEST_SUITES[@]}"
+
+        gtest_failed=false
+        for iteration in $(seq 1 "${GTEST_ITERATIONS_INPUT}"); do
+          remaining_seconds=$((REGRESSION_TEST_DEADLINE_EPOCH - $(date +%s)))
+          if [[ "${remaining_seconds}" -le 0 ]]; then
+            echo "GoogleTest runs exceeded the shared test timeout"
+            exit 124
+          fi
+
+          echo "=== GoogleTest iteration ${iteration}/${GTEST_ITERATIONS_INPUT} ==="
+          iteration_failed=false
+          for suite in "${SELECTED_GTEST_SUITES[@]}"; do
+            binary_path=$(find "${GITHUB_WORKSPACE}/${{ inputs.build-folder-name }}" -type f -name "${suite}" -executable -print -quit)
+            if [[ -z "${binary_path}" ]]; then
+              echo "Built GoogleTest executable not found: ${suite}"
+              exit 2
+            fi
+
+            gtest_code=0
+            gtest_args=()
+            if [[ -n "${GTEST_CASES_INPUT}" ]]; then
+              gtest_args+=("--gtest_filter=${GTEST_CASES_INPUT}")
+            fi
+            timeout --foreground "${remaining_seconds}s" "${binary_path}" "${gtest_args[@]}" || gtest_code=$?
+
+            if [[ "${gtest_code}" -eq 0 ]]; then
+              continue
+            fi
+            if [[ "${gtest_code}" -eq 1 ]]; then
+              gtest_failed=true
+              iteration_failed=true
+              if [[ "${CONTINUE_ON_TEST_FAILURE_INPUT}" == true ]]; then
+                continue
+              fi
+            fi
+            exit "${gtest_code}"
+          done
+
+          if [[ "${iteration_failed}" == true ]]; then
+            report_progress "${iteration}" "${GTEST_ITERATIONS_INPUT}" "failed"
+          else
+            report_progress "${iteration}" "${GTEST_ITERATIONS_INPUT}" "passed"
+          fi
+        done
+
+        if [[ "${gtest_failed}" == true || "${PYTEST_TEST_FAILURE}" == true ]]; then
+          exit 1
+        fi
+      env:
+        GTEST_SUITES_INPUT: ${{ inputs.gtest-suites }}
+        GTEST_CASES_INPUT: ${{ inputs.gtest-cases }}
+        GTEST_ITERATIONS_INPUT: ${{ inputs.gtest-iterations }}
+        CONTINUE_ON_TEST_FAILURE_INPUT: ${{ inputs.continue-on-test-failure }}
 
     - name: Upload regression JUnit results
       if: always()
