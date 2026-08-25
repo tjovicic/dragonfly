@@ -34,12 +34,15 @@ void ascii_pack_byte(uint8_t* bin, size_t ascii_len, size_t idx, uint8_t ascii);
 void ascii_pack(const char* ascii, size_t len, uint8_t* bin);
 void ascii_pack2(const char* ascii, size_t len, uint8_t* bin);
 
-// Fused ASCII validation + pack. If every byte of [ascii, ascii+len) is 7-bit ASCII (high bit
-// clear), packs them into `bin` in the format ascii_unpack decodes (byte-identical to ascii_pack,
-// but endian-neutral and valid for any len) and returns the packed length binpacked_len(len);
-// returns 0 if any byte has its high bit set. `bin` is scratch: it needs binpacked_len(len) bytes
-// and is written even on failure.
+// Validates and packs strings up to 64 KiB. Returns binpacked_len(len), or 0 for non-ASCII.
+// `bin` must not overlap `ascii`, needs binpacked_len(len) bytes, and is written on failure.
+// Prefer this when validation is needed; empty input also returns 0.
 size_t ascii_try_pack(const char* ascii, size_t len, uint8_t* bin);
+
+// Preferred unpack implementation for strings up to 64 KiB. Buffers need
+// binpacked_len(ascii_len) readable and ascii_len writable bytes. In-place input must be
+// right-aligned.
+void ascii_unpack_fast(const uint8_t* bin, size_t ascii_len, char* ascii);
 
 // SIMD implementation 1 of ascii_pack.
 void ascii_pack_simd(const char* ascii, size_t len, uint8_t* bin);
@@ -51,7 +54,8 @@ bool compare_packed(const uint8_t* packed, const char* ascii, size_t ascii_len);
 
 // maps ascii len to 7-bit packed length. Each 8 bytes are converted to 7 bytes.
 inline constexpr size_t binpacked_len(size_t ascii_len) {
-  return (ascii_len * 7 + 7) / 8; /* rounded up */
+  // Avoid multiplication overflow.
+  return ascii_len - ascii_len / 8;
 }
 
 // converts 7-bit packed length back to ascii length. Note that this conversion

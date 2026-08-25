@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <random>
+#include <type_traits>
 
 #include "base/gtest.h"
 #include "base/logging.h"
@@ -477,6 +478,86 @@ TEST_F(CompactObjectTest, AsciiUtil) {
   detail::ascii_unpack_simd(binvec.data(), data3.size(), act_str.data());
 
   ASSERT_EQ(data3, act_str);
+}
+
+TEST_F(CompactObjectTest, AsciiTryPack) {
+  EXPECT_EQ(detail::ascii_try_pack(nullptr, 0, nullptr), 0u);
+  detail::ascii_unpack_fast(nullptr, 0, nullptr);
+
+  vector<size_t> lengths;
+  for (size_t len = 0; len <= 256; ++len)
+    lengths.push_back(len);
+  for (size_t len :
+       {511, 512, 513, 1023, 1024, 1025, 1041, 1042, 1055, 1056, 4095, 4096, 4097, 65535, 65536})
+    lengths.push_back(len);
+
+  for (size_t len : lengths) {
+    string ascii(len, '\0');
+    for (size_t i = 0; i < len; ++i)
+      ascii[i] = static_cast<char>((i * 37 + len) & 0x7F);
+
+    const size_t packed_len = detail::binpacked_len(len);
+    vector<uint8_t> expected(packed_len);
+    detail::ascii_pack(ascii.data(), ascii.size(), expected.data());
+
+    constexpr size_t kPrefix = 3;
+    constexpr size_t kSuffix = 16;
+    vector<uint8_t> actual(kPrefix + packed_len + kSuffix, 0xA5);
+    EXPECT_EQ(detail::ascii_try_pack(ascii.data(), ascii.size(), actual.data() + kPrefix),
+              packed_len)
+        << "len=" << len;
+    EXPECT_EQ(string_view(reinterpret_cast<const char*>(actual.data() + kPrefix), packed_len),
+              string_view(reinterpret_cast<const char*>(expected.data()), packed_len))
+        << "len=" << len;
+    EXPECT_TRUE(
+        all_of(actual.begin(), actual.begin() + kPrefix, [](uint8_t c) { return c == 0xA5; }))
+        << "len=" << len;
+    EXPECT_TRUE(all_of(actual.begin() + kPrefix + packed_len, actual.end(),
+                       [](uint8_t c) { return c == 0xA5; }))
+        << "len=" << len;
+
+    vector<char> decoded(kPrefix + len + kSuffix, static_cast<char>(0xA5));
+    detail::ascii_unpack_fast(actual.data() + kPrefix, len, decoded.data() + kPrefix);
+    EXPECT_EQ(string_view(decoded.data() + kPrefix, len), string_view(ascii)) << "len=" << len;
+    EXPECT_TRUE(all_of(decoded.begin(), decoded.begin() + kPrefix,
+                       [](char c) { return static_cast<uint8_t>(c) == 0xA5; }))
+        << "len=" << len;
+    EXPECT_TRUE(all_of(decoded.begin() + kPrefix + len, decoded.end(),
+                       [](char c) { return static_cast<uint8_t>(c) == 0xA5; }))
+        << "len=" << len;
+
+    if (len > 0) {
+      vector<char> inplace(len, static_cast<char>(0xA5));
+      memcpy(inplace.data() + len - packed_len, expected.data(), packed_len);
+      detail::ascii_unpack_fast(reinterpret_cast<const uint8_t*>(inplace.data() + len - packed_len),
+                                len, inplace.data());
+      EXPECT_EQ(string_view(inplace.data(), inplace.size()), string_view(ascii))
+          << "right-aligned len=" << len;
+    }
+
+    vector<size_t> non_ascii_positions;
+    if (len <= 128) {
+      for (size_t i = 0; i < len; ++i)
+        non_ascii_positions.push_back(i);
+    } else {
+      for (size_t i : {size_t{0}, size_t{7}, size_t{8}, size_t{15}, size_t{16}, len / 2, len - 1}) {
+        if (i < len && find(non_ascii_positions.begin(), non_ascii_positions.end(), i) ==
+                           non_ascii_positions.end()) {
+          non_ascii_positions.push_back(i);
+        }
+      }
+    }
+
+    for (size_t non_ascii : non_ascii_positions) {
+      ascii[non_ascii] = static_cast<char>(0x80 | static_cast<uint8_t>(ascii[non_ascii]));
+      EXPECT_EQ(detail::ascii_try_pack(ascii.data(), ascii.size(), actual.data() + kPrefix), 0u)
+          << "len=" << len << " non_ascii=" << non_ascii;
+      EXPECT_TRUE(all_of(actual.begin() + kPrefix + packed_len, actual.end(),
+                         [](uint8_t c) { return c == 0xA5; }))
+          << "len=" << len << " non_ascii=" << non_ascii;
+      ascii[non_ascii] = static_cast<char>(static_cast<uint8_t>(ascii[non_ascii]) & 0x7F);
+    }
+  }
 }
 
 TEST_F(CompactObjectTest, AsciiPackByte) {
@@ -1452,59 +1533,66 @@ static void BM_PackNaive(benchmark::State& state) {
 }
 BENCHMARK(BM_PackNaive);
 
-static void BM_Pack(benchmark::State& state) {
-  string val(1024, 'a');
-  uint8_t buf[1024];
+static void ValidateAndPack2(const char* ascii, size_t len, uint8_t* bin) {
+  if (detail::validate_ascii_fast(ascii, len))
+    detail::ascii_pack2(ascii, len, bin);
+}
+
+static void ValidateAndPackSimd2(const char* ascii, size_t len, uint8_t* bin) {
+  if (detail::validate_ascii_fast(ascii, len))
+    detail::ascii_pack_simd2(ascii, len, bin);
+}
+
+using AsciiPackFunction = void (*)(const char*, size_t, uint8_t*);
+using AsciiTryPackFunction = size_t (*)(const char*, size_t, uint8_t*);
+using AsciiUnpackFunction = void (*)(const uint8_t*, size_t, char*);
+
+template <auto operation> static void BM_AsciiCodec(benchmark::State& state) {
+  constexpr bool kPack = is_same_v<decltype(operation), AsciiPackFunction>;
+  constexpr bool kTryPack = is_same_v<decltype(operation), AsciiTryPackFunction>;
+  constexpr bool kUnpack = is_same_v<decltype(operation), AsciiUnpackFunction>;
+  static_assert(kPack || kTryPack || kUnpack);
+
+  string val(state.range(0), 'a');
+  vector<uint8_t> buf(max<size_t>(detail::binpacked_len(val.size()), 1));
+  if constexpr (kUnpack)
+    detail::ascii_pack(val.data(), val.size(), buf.data());
 
   while (state.KeepRunning()) {
-    detail::ascii_pack(val.data(), val.size(), buf);
+    if constexpr (kTryPack)
+      benchmark::DoNotOptimize(operation(val.data(), val.size(), buf.data()));
+    else if constexpr (kUnpack)
+      operation(buf.data(), val.size(), val.data());
+    else
+      operation(val.data(), val.size(), buf.data());
+    benchmark::ClobberMemory();
   }
+  state.SetBytesProcessed(state.iterations() * val.size());
 }
-BENCHMARK(BM_Pack);
 
-static void BM_PackSimd(benchmark::State& state) {
-  string val(1024, 'a');
-  uint8_t buf[1024];
-
-  while (state.KeepRunning()) {
-    detail::ascii_pack_simd(val.data(), val.size(), buf);
-  }
+static void AsciiCodecArgs(benchmark::Benchmark* benchmark) {
+  benchmark->ArgName("len");
+  for (int len : {0,  1,  7,  8,  13, 16,  17,  18,  25,   27,   32,   33,   48,   49,   61,   64,
+                  65, 81, 82, 95, 96, 100, 128, 256, 1024, 1041, 1042, 1055, 1056, 4096, 65536})
+    benchmark->Arg(len);
 }
-BENCHMARK(BM_PackSimd);
 
-static void BM_PackSimd2(benchmark::State& state) {
-  string val(1024, 'a');
-  uint8_t buf[1024];
-
-  while (state.KeepRunning()) {
-    detail::ascii_pack_simd2(val.data(), val.size(), buf);
-  }
+static void AsciiSimdPackArgs(benchmark::Benchmark* benchmark) {
+  benchmark->ArgName("len");
+  for (int len : {32, 33, 61, 64, 100, 128, 256, 1024, 4096, 65536})
+    benchmark->Arg(len);
 }
-BENCHMARK(BM_PackSimd2);
 
-static void BM_Unpack(benchmark::State& state) {
-  string val(1024, 'a');
-  uint8_t buf[1024];
-
-  detail::ascii_pack(val.data(), val.size(), buf);
-
-  while (state.KeepRunning()) {
-    detail::ascii_unpack(buf, val.size(), val.data());
-  }
-}
-BENCHMARK(BM_Unpack);
-
-static void BM_UnpackSimd(benchmark::State& state) {
-  string val(1024, 'a');
-  uint8_t buf[1024];
-
-  detail::ascii_pack(val.data(), val.size(), buf);
-
-  while (state.KeepRunning()) {
-    detail::ascii_unpack_simd(buf, val.size(), val.data());
-  }
-}
-BENCHMARK(BM_UnpackSimd);
+BENCHMARK_TEMPLATE(BM_AsciiCodec, detail::ascii_pack)->Apply(AsciiCodecArgs);
+BENCHMARK_TEMPLATE(BM_AsciiCodec, detail::ascii_pack2)->Apply(AsciiCodecArgs);
+BENCHMARK_TEMPLATE(BM_AsciiCodec, detail::ascii_pack_simd)->Apply(AsciiSimdPackArgs);
+BENCHMARK_TEMPLATE(BM_AsciiCodec, detail::ascii_pack_simd2)->Apply(AsciiSimdPackArgs);
+BENCHMARK_TEMPLATE(BM_AsciiCodec, detail::ascii_try_pack)->Apply(AsciiCodecArgs);
+BENCHMARK_TEMPLATE(BM_AsciiCodec, ValidateAndPack2)->Apply(AsciiCodecArgs);
+BENCHMARK_TEMPLATE(BM_AsciiCodec, ValidateAndPackSimd2)->Apply(AsciiSimdPackArgs);
+BENCHMARK_TEMPLATE(BM_AsciiCodec, detail::ascii_unpack)->Apply(AsciiCodecArgs);
+BENCHMARK_TEMPLATE(BM_AsciiCodec, detail::ascii_unpack_simd)->Apply(AsciiCodecArgs);
+BENCHMARK_TEMPLATE(BM_AsciiCodec, detail::ascii_unpack_fast)->Apply(AsciiCodecArgs);
 
 static void BM_LpCompare(benchmark::State& state) {
   std::mt19937_64 rd;
